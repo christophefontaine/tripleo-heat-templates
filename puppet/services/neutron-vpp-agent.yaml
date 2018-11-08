@@ -37,6 +37,33 @@ parameters:
       Example: "physnet1:GigabitEthernet2/2/0,physnet2:GigabitEthernet2/3/0"
     type: comma_delimited_list
     default: ""
+    tags:
+      - role_specific
+  NeutronVhostuserSocketDir:
+    default: "/var/lib/vhost_sockets"
+    description: The vhost-user socket directory for VPP
+    type: string
+    tags:
+      - role_specific
+  VhostuserSocketGroup:
+    default: "qemu"
+    description: >
+      The vhost-user socket directory group name.
+      Defaults to 'qemu'. When vhostuser mode is 'dpdkvhostuserclient'
+      (which is the default mode), the vhost socket is created by qemu.
+    type: string
+    tags:
+      - role_specific
+  VhostuserSocketUser:
+    default: "qemu"
+    description: >
+      The vhost-user socket directory user name.
+      Defaults to 'qemu'. When vhostuser mode is 'dpdkvhostuserclient'
+      (which is the default mode), the vhost socket is created by qemu.
+    type: string
+    tags:
+      - role_specific
+
 
 resources:
 
@@ -48,6 +75,26 @@ resources:
       DefaultPasswords: {get_param: DefaultPasswords}
       EndpointMap: {get_param: EndpointMap}
 
+  # Merging role-specific parameters (RoleParameters) with the default parameters.
+  # RoleParameters will have the precedence over the default parameters.
+  RoleParametersValue:
+    type: OS::Heat::Value
+    properties:
+      type: json
+      value:
+        map_replace:
+          - map_replace:
+            - vhostuser_socket_group: VhostuserSocketGroup
+              vhostuser_socket_user: VhostuserSocketUser
+              neutron::agents::ml2::vpp::physnets: NeutronVPPAgentPhysnets
+              neutron::agents::ml2::vpp::vhost_user_dir: NeutronVhostuserSocketDir
+            - values: {get_param: [RoleParameters]}
+          - values:
+              NeutronVhostuserSocketDir: {get_param: NeutronVhostuserSocketDir}
+              VhostuserSocketGroup: {get_param: VhostuserSocketGroup}
+              VhostuserSocketUser: {get_param: VhostuserSocketUser}
+              NeutronVPPAgentPhysnets: {get_param: NeutronVPPAgentPhysnets}
+
 outputs:
   role_data:
     description: Role data for the Neutron ML2/VPP agent service.
@@ -56,7 +103,19 @@ outputs:
       config_settings:
         map_merge:
           - get_attr: [NeutronBase, role_data, config_settings]
-          - tripleo::profile::base::neutron::agents::vpp::physnet_mapping: {get_param: NeutronVPPAgentPhysnets}
+          - get_attr: [RoleParametersValue, value]
+            # Physnet to use for vxlan tunnels
+          - neutron::agents::ml2::vpp::gpe_locators: {get_param: [ServiceNetMap, NeutronTenantNetwork]}
+            # Source CIDR for vxlan tunnels
+            neutron::agents::ml2::vpp::gpe_src_cidr:
+              str_replace:
+                 template:
+                   "%{hiera('$CIDR')}"
+                 params:
+                   $CIDR: {get_param: [ServiceNetMap, NeutronTenantSubnet]}
+      service_config_settings:
+        nova_libvirt:
+          nova::compute::libvirt::qemu::group: {get_attr: [RoleParametersValue, value, vhostuser_socket_group]}
       step_config: |
         include ::tripleo::profile::base::neutron::agents::vpp
       metadata_settings:

@@ -1,0 +1,168 @@
+heat_template_version: rocky
+
+description: >
+  OpenStack Neutron ML2/VPP agent service
+
+parameters:
+  DockerNeutronVppAgentImage:
+    description: The container image to use for the Neutron SR-IOV agent
+    type: string
+  DockerNeutronConfigImage:
+    description: The container image to use for the neutron config_volume
+    type: string
+  ServiceData:
+    default: {}
+    description: Dictionary packing service data
+    type: json
+  ServiceNetMap:
+    default: {}
+    description: Mapping of service_name -> network name. Typically set
+                 via parameter_defaults in the resource registry.  This
+                 mapping overrides those in ServiceNetMapDefaults.
+    type: json
+  DefaultPasswords:
+    default: {}
+    type: json
+  RoleName:
+    default: ''
+    description: Role name on which the service is applied
+    type: string
+  RoleParameters:
+    default: {}
+    description: Parameters specific to the role
+    type: json
+  EndpointMap:
+    default: {}
+    description: Mapping of service endpoint -> protocol. Typically set
+                 via parameter_defaults in the resource registry.
+    type: json
+  NeutronVPPAgentPhysnets:
+    description: >
+      List of <physical_network>:<VPP Interface>
+      Example: "physnet1:GigabitEthernet2/2/0,physnet2:GigabitEthernet2/3/0"
+    type: comma_delimited_list
+    default: ""
+    tags:
+      - role_specific
+  NeutronVhostuserSocketDir:
+    description: The vhost-user socket directory for VPP
+    type: string
+    default: "/var/lib/vhost_sockets"
+    tags:
+      - role_specific
+
+
+resources:
+  RoleParametersValue:
+    type: OS::Heat::Value
+    properties:
+      type: json
+      value:
+        map_replace:
+          - map_replace:
+            - NeutronVhostuserSocketDir: NeutronVhostuserSocketDir
+              NeutronVPPAgentPhysnets: NeutronVPPAgentPhysnets
+            - values: {get_param: [RoleParameters]}
+          - values:
+              NeutronVPPAgentPhysnets: {get_param: NeutronVPPAgentPhysnets}
+              NeutronVhostuserSocketDir: {get_param: NeutronVhostuserSocketDir}
+
+
+  ContainersCommon:
+    type: ./containers-common.yaml
+
+  NeutronVppAgentBase:
+    type: ../../puppet/services/neutron-vpp-agent.yaml
+    properties:
+      EndpointMap: {get_param: EndpointMap}
+      ServiceData: {get_param: ServiceData}
+      ServiceNetMap: {get_param: ServiceNetMap}
+      DefaultPasswords: {get_param: DefaultPasswords}
+      RoleName: {get_param: RoleName}
+      RoleParameters: {get_param: RoleParameters}
+
+  NeutronLogging:
+    type: OS::TripleO::Services::Logging::NeutronCommon
+    properties:
+      NeutronServiceName: vpp-agent
+
+outputs:
+  role_data:
+    description: Role data for Neutron ML2/VPP agent service
+    value:
+      service_name: {get_attr: [NeutronVppAgentBase, role_data, service_name]}
+      config_settings:
+        map_merge:
+          - get_attr: [NeutronVppAgentBase, role_data, config_settings]
+          - get_attr: [NeutronLogging, config_settings]
+      puppet_config:
+        config_volume: neutron
+        puppet_tags: neutron_config,neutron_agent_vpp
+        step_config:
+          get_attr: [NeutronVppAgentBase, role_data, step_config]
+        config_image: {get_param: DockerNeutronConfigImage}
+      kolla_config:
+        /var/lib/kolla/config_files/neutron_vpp_agent.json:
+          command: /usr/bin/vpp-agent --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini --config-file /etc/neutron/plugins/ml2/vpp_agent.ini --log-file=/var/log/neutron/vpp-agent.log
+          config_files:
+            - source: "/var/lib/kolla/config_files/src/*"
+              dest: "/"
+              merge: true
+              preserve_properties: true
+          permissions:
+            - path: /var/log/neutron
+              owner: neutron:neutron
+              recurse: true
+      docker_config_scripts:
+        neutron_vpp_agent_launcher.sh:
+          mode: "0755"
+          content: |
+            #!/bin/bash
+            set -xe
+            /usr/bin/vpp-agent --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini --config-dir /etc/neutron/conf.d/common --log-file=/var/log/vpp/vpp-agent.log
+      docker_config:
+        step_2:
+          get_attr: [NeutronLogging, docker_config, step_2]
+        step_3:
+          # Neutron VPP-Agent should start after etcd (step2), but before neutron-server (step4)
+          # in order to have etcd populated with the appropriate infos when neutron-api starts
+          neutron_vpp_agent:
+            image: {get_param: DockerNeutronVppAgentImage}
+            net: host
+            restart: always
+            volumes:
+              list_concat:
+                - {get_attr: [ContainersCommon, volumes]}
+                - {get_attr: [NeutronLogging, volumes]}
+                -
+                  - /var/lib/kolla/config_files/neutron_vpp_agent.json:/var/lib/kolla/config_files/config.json:ro
+                  - /var/lib/config-data/puppet-generated/neutron/:/var/lib/kolla/config_files/src:ro
+                  - /run/vpp-api.sock:/run/vpp-api.sock:rw
+                  - /dev/shm/global_vm:/dev/shm/global_vm:rw
+                  - /dev/shm/vpe-api:/dev/shm/vpe-api:rw
+                  - /var/lib/vhost_sockets:/var/lib/vhost_sockets:rw
+            environment:
+              - KOLLA_CONFIG_STRATEGY=COPY_ALWAYS
+      host_prep_tasks: {get_attr: [NeutronLogging, host_prep_tasks]}
+      metadata_settings:
+       get_attr: [NeutronVppAgentBase, role_data, metadata_settings]
+      upgrade_tasks:
+        - when: step|int == 0
+          tags: common
+          block:
+            - name: Check if neutron_vpp_agent is deployed
+              command: systemctl is-enabled --quiet neutron-vpp-agent
+              ignore_errors: True
+              register: neutron_vpp_agent_enabled_result
+            - name: Set fact neutron_vpp_agent_enabled
+              set_fact:
+                neutron_vpp_agent_enabled: "{{ neutron_vpp_agent_enabled_result.rc == 0 }}"
+            - name: "PreUpgrade step0,validation: Check service neutron-vpp-agent is running"
+              command: systemctl is-active --quiet neutron-vpp-agent
+              when: neutron_vpp_agent_enabled|bool
+              tags: validation
+        - when: step|int == 2
+          block:
+            - name: Stop and disable neutron_vpp_agent service
+              when: neutron_vpp_agent_enabled|bool
+              service: name=neutron-vpp-agent state=stopped enabled=no
